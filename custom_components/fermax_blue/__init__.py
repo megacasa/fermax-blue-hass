@@ -117,7 +117,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: FermaxBlueConfigEntry) -
 
     for pairing in pairings:
         coordinator = FermaxBlueCoordinator(
-            hass, api, pairing, scan_interval, auto_response_file, firebase_config
+            hass,
+            api,
+            pairing,
+            scan_interval=scan_interval,
+            auto_response_file=auto_response_file,
+            firebase_config=firebase_config,
+            fcm_storage_key_suffix=f"{entry.entry_id}_{pairing.device_id}",
         )
         await coordinator.async_config_entry_first_refresh()
 

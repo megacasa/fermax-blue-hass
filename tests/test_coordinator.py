@@ -198,3 +198,24 @@ class TestCoordinatorScanInterval:
             FermaxBlueCoordinator(mock_hass, mock_api, pairing, scan_interval=10)
             call_kwargs = mock_init.call_args
             assert call_kwargs.kwargs["update_interval"].total_seconds() == 600
+
+    def test_default_fcm_storage_suffix_uses_device_id(self, mock_hass, mock_api, pairing):
+        with patch(
+            "homeassistant.helpers.update_coordinator.DataUpdateCoordinator.__init__",
+            return_value=None,
+        ):
+            coordinator = FermaxBlueCoordinator(mock_hass, mock_api, pairing)
+            assert coordinator._fcm_storage_key_suffix == "dev1"
+
+    def test_custom_fcm_storage_suffix_is_kept(self, mock_hass, mock_api, pairing):
+        with patch(
+            "homeassistant.helpers.update_coordinator.DataUpdateCoordinator.__init__",
+            return_value=None,
+        ):
+            coordinator = FermaxBlueCoordinator(
+                mock_hass,
+                mock_api,
+                pairing,
+                fcm_storage_key_suffix="entry123_dev1",
+            )
+            assert coordinator._fcm_storage_key_suffix == "entry123_dev1"

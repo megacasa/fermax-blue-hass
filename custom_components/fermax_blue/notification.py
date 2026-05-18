@@ -51,6 +51,7 @@ class FermaxNotificationListener:
         firebase_app_id: str,
         firebase_project_id: str,
         firebase_package_name: str,
+        storage_key_suffix: str | None = None,
     ) -> None:
         self._hass = hass
         self._notification_callback = notification_callback
@@ -63,7 +64,15 @@ class FermaxNotificationListener:
             messaging_sender_id=str(firebase_sender_id),
             bundle_id=firebase_package_name,
         )
-        self._store: Store = Store(hass, _FCM_STORAGE_VERSION, _FCM_STORAGE_KEY)
+        safe_suffix = "".join(
+            ch if ch.isalnum() or ch in "._-" else "_"
+            for ch in (storage_key_suffix or "default")
+        )
+        self._store: Store = Store(
+            hass,
+            _FCM_STORAGE_VERSION,
+            f"{_FCM_STORAGE_KEY}_{safe_suffix}",
+        )
         self._lifecycle_lock = asyncio.Lock()
 
     @property

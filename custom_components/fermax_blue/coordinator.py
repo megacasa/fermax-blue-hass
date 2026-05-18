@@ -60,6 +60,7 @@ class FermaxBlueCoordinator(DataUpdateCoordinator):
         scan_interval: int = 5,
         auto_response_file: str = "",
         firebase_config: dict[str, str | int] | None = None,
+        fcm_storage_key_suffix: str | None = None,
     ) -> None:
         super().__init__(
             hass,
@@ -90,6 +91,7 @@ class FermaxBlueCoordinator(DataUpdateCoordinator):
         self._stream_duration = DEFAULT_STREAM_DURATION
         self._stream_stop_unsub: CALLBACK_TYPE | None = None
         self._firebase_config = firebase_config or {}
+        self._fcm_storage_key_suffix = fcm_storage_key_suffix or pairing.device_id
         self._processed_notifications: deque[str] = deque(maxlen=100)
         self._notification_start_time: float | None = None
 
@@ -272,6 +274,7 @@ class FermaxBlueCoordinator(DataUpdateCoordinator):
             firebase_app_id=str(self._firebase_config.get("firebase_app_id", "")),
             firebase_project_id=str(self._firebase_config.get("firebase_project_id", "")),
             firebase_package_name=str(self._firebase_config.get("firebase_package_name", "")),
+            storage_key_suffix=self._fcm_storage_key_suffix,
         )
 
         # Load persisted last photo for camera preview
