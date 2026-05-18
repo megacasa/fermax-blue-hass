@@ -23,7 +23,7 @@ def _make_listener(*, with_credentials: bool = True) -> FermaxNotificationListen
     return listener
 
 
-def test_store_key_defaults_to_default_suffix():
+def test_store_key_uses_shared_default():
     with patch("custom_components.fermax_blue.notification.Store") as store_cls:
         FermaxNotificationListener(
             hass=MagicMock(),
@@ -35,23 +35,7 @@ def test_store_key_defaults_to_default_suffix():
             firebase_package_name="com.fermax.blue.app",
         )
 
-    assert store_cls.call_args.args[2] == "fermax_blue_fcm_credentials_default"
-
-
-def test_store_key_uses_sanitized_suffix():
-    with patch("custom_components.fermax_blue.notification.Store") as store_cls:
-        FermaxNotificationListener(
-            hass=MagicMock(),
-            notification_callback=lambda *a, **kw: None,
-            firebase_api_key="key",
-            firebase_sender_id=1,
-            firebase_app_id="app",
-            firebase_project_id="proj",
-            firebase_package_name="com.fermax.blue.app",
-            storage_key_suffix="entry:abc/device?1",
-        )
-
-    assert store_cls.call_args.args[2] == "fermax_blue_fcm_credentials_entry_abc_device_1"
+    assert store_cls.call_args.args[2] == "fermax_blue_fcm_credentials"
 
 
 @pytest.fixture

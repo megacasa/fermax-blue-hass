@@ -37,7 +37,8 @@ from .const import (
     SIGNAL_DOOR_OPENED,
     SIGNAL_DOORBELL_RING,
 )
-from .notification import FermaxNotificationListener, _redact_notification
+from .notification import _redact_notification
+from .notification_manager import FermaxSharedNotificationManager
 from .streaming import DEFAULT_SIGNALING_URL, FermaxStreamSession
 
 _LOGGER = logging.getLogger(__name__)
@@ -59,8 +60,6 @@ class FermaxBlueCoordinator(DataUpdateCoordinator):
         pairing: Pairing,
         scan_interval: int = 5,
         auto_response_file: str = "",
-        firebase_config: dict[str, str | int] | None = None,
-        fcm_storage_key_suffix: str | None = None,
     ) -> None:
         super().__init__(
             hass,
@@ -71,7 +70,9 @@ class FermaxBlueCoordinator(DataUpdateCoordinator):
         self.api = api
         self.pairing = pairing
         self.device_info: DeviceInfo | None = None
-        self.notification_listener: FermaxNotificationListener | None = None
+        self._notification_manager: FermaxSharedNotificationManager | None = None
+        self._notification_unsubscribe: CALLBACK_TYPE | None = None
+        self._fcm_token: str | None = None
         self._last_photo: bytes | None = None
         self._last_photo_id: str | None = None
         self._doorbell_ringing: bool = False
@@ -90,8 +91,6 @@ class FermaxBlueCoordinator(DataUpdateCoordinator):
         self._call_mode = CALL_MODE_NOTIFY
         self._stream_duration = DEFAULT_STREAM_DURATION
         self._stream_stop_unsub: CALLBACK_TYPE | None = None
-        self._firebase_config = firebase_config or {}
-        self._fcm_storage_key_suffix = fcm_storage_key_suffix or pairing.device_id
         self._processed_notifications: deque[str] = deque(maxlen=100)
         self._notification_start_time: float | None = None
 
@@ -194,6 +193,13 @@ class FermaxBlueCoordinator(DataUpdateCoordinator):
         """Return the active stream session, if any."""
         return self._stream_session
 
+    @property
+    def notification_listener(self) -> Any | None:
+        """Compatibility shim for entities/diagnostics using listener state."""
+        if self._notification_manager:
+            return self._notification_manager._listener
+        return None
+
     async def _async_update_data(self) -> dict[str, Any]:
         """Fetch data from the API.
 
@@ -211,9 +217,9 @@ class FermaxBlueCoordinator(DataUpdateCoordinator):
         self.device_info = device_info
 
         # Fetch call log if FCM token is available
-        if self.notification_listener and self.notification_listener.fcm_token:
+        if self._fcm_token:
             try:
-                call_log = await self.api.get_call_log(self.notification_listener.fcm_token)
+                call_log = await self.api.get_call_log(self._fcm_token)
                 self._call_log = call_log
                 if call_log:
                     self._last_call = max(call_log, key=lambda c: c.call_date)
@@ -232,11 +238,11 @@ class FermaxBlueCoordinator(DataUpdateCoordinator):
                 _LOGGER.debug("Failed to fetch call log/photo", exc_info=True)
 
         # Fetch DND status
-        if self.notification_listener and self.notification_listener.fcm_token:
+        if self._fcm_token:
             try:
                 self._dnd_enabled = await self.api.get_dnd_status(
                     self.pairing.device_id,
-                    self.notification_listener.fcm_token,
+                    self._fcm_token,
                 )
             except Exception:
                 _LOGGER.debug("Failed to fetch DND status", exc_info=True)
@@ -263,28 +269,27 @@ class FermaxBlueCoordinator(DataUpdateCoordinator):
             "wireless_signal": device_info.wireless_signal,
         }
 
-    async def setup_notifications(self, storage_path: Path) -> None:
+    async def setup_notifications(
+        self,
+        storage_path: Path,
+        notification_manager: FermaxSharedNotificationManager,
+    ) -> None:
         """Set up the FCM notification listener."""
         self._storage_path = storage_path
-        self.notification_listener = FermaxNotificationListener(
-            hass=self.hass,
-            notification_callback=self._handle_notification,
-            firebase_api_key=str(self._firebase_config.get("firebase_api_key", "")),
-            firebase_sender_id=self._firebase_config.get("firebase_sender_id", 0),
-            firebase_app_id=str(self._firebase_config.get("firebase_app_id", "")),
-            firebase_project_id=str(self._firebase_config.get("firebase_project_id", "")),
-            firebase_package_name=str(self._firebase_config.get("firebase_package_name", "")),
-            storage_key_suffix=self._fcm_storage_key_suffix,
-        )
+        self._notification_manager = notification_manager
 
         # Load persisted last photo for camera preview
         await self._load_last_photo()
 
-        fcm_token = await self.notification_listener.register()
+        fcm_token = await notification_manager.async_get_or_register_token()
         if fcm_token:
+            self._fcm_token = fcm_token
             await self.api.register_app_token(fcm_token, active=True)
             self._notification_start_time = time.monotonic()
-            await self.notification_listener.start()
+            if self._notification_unsubscribe:
+                self._notification_unsubscribe()
+            self._notification_unsubscribe = notification_manager.subscribe(self._handle_notification)
+            await notification_manager.async_start()
             _LOGGER.info(
                 "Notification listener started for device %s",
                 self.pairing.device_id,
@@ -292,17 +297,18 @@ class FermaxBlueCoordinator(DataUpdateCoordinator):
 
     async def stop_notifications(self) -> None:
         """Stop the notification listener."""
-        if self.notification_listener:
-            if self.notification_listener.fcm_token:
-                await self.api.register_app_token(
-                    self.notification_listener.fcm_token, active=False
-                )
-            await self.notification_listener.stop()
+        if self._fcm_token:
+            await self.api.register_app_token(self._fcm_token, active=False)
+        if self._notification_unsubscribe:
+            self._notification_unsubscribe()
+            self._notification_unsubscribe = None
+        if self._notification_manager:
+            await self._notification_manager.async_maybe_stop()
 
     async def ensure_notifications_running(self) -> None:
         """Watchdog hook: revive the FCM listener if it died."""
-        if self.notification_listener:
-            await self.notification_listener.ensure_running()
+        if self._notification_manager:
+            await self._notification_manager.async_ensure_running()
 
     @callback
     def _handle_notification(self, notification: dict, persistent_id: str) -> None:
@@ -333,6 +339,8 @@ class FermaxBlueCoordinator(DataUpdateCoordinator):
 
         # Notification data may be nested under "data" key
         data = notification.get("data", notification)
+        if not self._notification_targets_pairing(data):
+            return
 
         # ACK the notification for reliability
         fcm_message_id = (
@@ -400,11 +408,10 @@ class FermaxBlueCoordinator(DataUpdateCoordinator):
 
         # If there's an active stream, use the in-call endpoint
         if self._stream_session and self._stream_session.is_active:
-            fcm_token = self.notification_listener.fcm_token if self.notification_listener else None
             success = await self.api.open_door_incall(
                 device_id=self.pairing.device_id,
                 room_id=self._stream_session._room_id,
-                fcm_token=fcm_token,
+                fcm_token=self._fcm_token,
                 call_as=self.pairing.device_id,
             )
         else:
@@ -430,13 +437,13 @@ class FermaxBlueCoordinator(DataUpdateCoordinator):
 
     async def start_camera_preview(self) -> DivertResponse | None:
         """Start camera preview (auto-on) to view the intercom camera."""
-        if not self.notification_listener or not self.notification_listener.fcm_token:
+        if not self._fcm_token:
             _LOGGER.error("Cannot start camera: no FCM token available")
             return None
 
         result = await self.api.auto_on(
             self.pairing.device_id,
-            self.notification_listener.fcm_token,
+            self._fcm_token,
         )
 
         if result:
@@ -468,21 +475,21 @@ class FermaxBlueCoordinator(DataUpdateCoordinator):
 
     async def change_video_source(self) -> DivertResponse | None:
         """Request a video source change on the intercom."""
-        if not self.notification_listener or not self.notification_listener.fcm_token:
+        if not self._fcm_token:
             return None
 
         return await self.api.change_video_source(
             self.pairing.device_id,
-            self.notification_listener.fcm_token,
+            self._fcm_token,
         )
 
     async def set_dnd(self, enabled: bool) -> None:
         """Set Do Not Disturb."""
-        if not self.notification_listener or not self.notification_listener.fcm_token:
+        if not self._fcm_token:
             return
         await self.api.set_dnd(
             self.pairing.device_id,
-            self.notification_listener.fcm_token,
+            self._fcm_token,
             enabled=enabled,
         )
         self._dnd_enabled = enabled
@@ -505,9 +512,7 @@ class FermaxBlueCoordinator(DataUpdateCoordinator):
         """Start a video stream session for the given room."""
         await self.stop_stream()
 
-        if not self.notification_listener:
-            return
-        fcm_token = self.notification_listener.fcm_token
+        fcm_token = self._fcm_token
         if not fcm_token:
             return
         oauth_token = fermax_token or await self.api.get_access_token()
@@ -578,3 +583,20 @@ class FermaxBlueCoordinator(DataUpdateCoordinator):
             await self._stream_session.stop()
             self._stream_session = None
             self._camera_active = False
+
+    def _notification_targets_pairing(self, data: dict[str, Any]) -> bool:
+        """Return True when notification payload appears to target this pairing."""
+        pairing_id = str(self.pairing.device_id)
+        direct_ids = {
+            str(data[key])
+            for key in ("deviceId", "DeviceId", "callAs", "CallAs", "unitId", "UnitId")
+            if data.get(key)
+        }
+        if direct_ids:
+            return pairing_id in direct_ids
+
+        room_id = data.get("RoomId") or data.get("roomId")
+        if isinstance(room_id, str) and room_id:
+            return room_id == pairing_id or room_id.startswith(f"{pairing_id}_")
+
+        return False

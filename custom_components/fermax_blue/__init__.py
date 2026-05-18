@@ -37,10 +37,13 @@ from .const import (
     RECORDINGS_DIR,
 )
 from .coordinator import FermaxBlueCoordinator
+from .notification_manager import FermaxSharedNotificationManager
 
 _LOGGER = logging.getLogger(__name__)
 
 type FermaxBlueConfigEntry = ConfigEntry[list[FermaxBlueCoordinator]]
+
+DATA_NOTIFICATION_MANAGER = "notification_manager"
 
 
 _V2_REQUIRED_KEYS = {
@@ -112,6 +115,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: FermaxBlueConfigEntry) -
         "firebase_project_id": entry.data[CONF_FIREBASE_PROJECT_ID],
         "firebase_package_name": entry.data[CONF_FIREBASE_PACKAGE_NAME],
     }
+    domain_data = hass.data.setdefault(DOMAIN, {})
+    notification_manager = _get_or_create_notification_manager(hass, firebase_config)
 
     coordinators: list[FermaxBlueCoordinator] = []
 
@@ -122,19 +127,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: FermaxBlueConfigEntry) -
             pairing,
             scan_interval=scan_interval,
             auto_response_file=auto_response_file,
-            firebase_config=firebase_config,
-            fcm_storage_key_suffix=f"{entry.entry_id}_{pairing.device_id}",
         )
         await coordinator.async_config_entry_first_refresh()
 
         storage_path = Path(hass.config.config_dir) / ".storage" / DOMAIN
         await asyncio.to_thread(storage_path.mkdir, parents=True, exist_ok=True)
-        await coordinator.setup_notifications(storage_path)
+        await coordinator.setup_notifications(storage_path, notification_manager)
 
         coordinators.append(coordinator)
 
     entry.runtime_data = coordinators
-    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinators
+    domain_data[entry.entry_id] = coordinators
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
@@ -247,10 +250,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: FermaxBlueConfigEntry) -
 
     async def _fcm_watchdog(_now: datetime | None = None) -> None:
         """Revive any FCM listener whose receiver has died."""
-        await asyncio.gather(
-            *(c.ensure_notifications_running() for c in coordinators),
-            return_exceptions=True,
-        )
+        await notification_manager.async_ensure_running()
 
     entry.async_on_unload(
         async_track_time_interval(hass, _fcm_watchdog, timedelta(seconds=FCM_WATCHDOG_INTERVAL))
@@ -352,6 +352,38 @@ async def async_unload_entry(hass: HomeAssistant, entry: FermaxBlueConfigEntry) 
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
 
     if unload_ok:
-        hass.data[DOMAIN].pop(entry.entry_id, None)
+        domain_data = hass.data.get(DOMAIN, {})
+        domain_data.pop(entry.entry_id, None)
+        manager = domain_data.get(DATA_NOTIFICATION_MANAGER)
+        if manager and _no_loaded_entries(domain_data):
+            await manager.async_stop()
+            domain_data.pop(DATA_NOTIFICATION_MANAGER, None)
 
     return unload_ok
+
+
+def _get_or_create_notification_manager(
+    hass: HomeAssistant,
+    firebase_config: dict[str, str | int],
+) -> FermaxSharedNotificationManager:
+    """Return shared notification manager for this HA instance."""
+    domain_data = hass.data.setdefault(DOMAIN, {})
+    manager = domain_data.get(DATA_NOTIFICATION_MANAGER)
+    if manager:
+        return manager
+
+    manager = FermaxSharedNotificationManager(
+        hass=hass,
+        firebase_api_key=str(firebase_config.get("firebase_api_key", "")),
+        firebase_sender_id=firebase_config.get("firebase_sender_id", 0),
+        firebase_app_id=str(firebase_config.get("firebase_app_id", "")),
+        firebase_project_id=str(firebase_config.get("firebase_project_id", "")),
+        firebase_package_name=str(firebase_config.get("firebase_package_name", "")),
+    )
+    domain_data[DATA_NOTIFICATION_MANAGER] = manager
+    return manager
+
+
+def _no_loaded_entries(domain_data: dict[str, object]) -> bool:
+    """Return True when no config-entry runtime data remains."""
+    return all(key == DATA_NOTIFICATION_MANAGER for key in domain_data)

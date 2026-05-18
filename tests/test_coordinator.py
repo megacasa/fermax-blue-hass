@@ -80,7 +80,9 @@ def coordinator(mock_hass, mock_api, pairing):
         coord.pairing = pairing
         coord.hass = mock_hass
         coord.device_info = None
-        coord.notification_listener = None
+        coord._notification_manager = None
+        coord._notification_unsubscribe = None
+        coord._fcm_token = None
         coord._last_photo = None
         coord._last_photo_id = None
         coord._doorbell_ringing = False
@@ -102,8 +104,7 @@ class TestCoordinatorDnd:
 
     @pytest.mark.asyncio
     async def test_set_dnd_calls_api(self, coordinator, mock_api):
-        coordinator.notification_listener = MagicMock()
-        coordinator.notification_listener.fcm_token = "tok"
+        coordinator._fcm_token = "tok"
 
         await coordinator.set_dnd(True)
         mock_api.set_dnd.assert_called_once_with("dev1", "tok", enabled=True)
@@ -111,7 +112,7 @@ class TestCoordinatorDnd:
 
     @pytest.mark.asyncio
     async def test_set_dnd_no_listener(self, coordinator, mock_api):
-        coordinator.notification_listener = None
+        coordinator._fcm_token = None
 
         await coordinator.set_dnd(True)
         mock_api.set_dnd.assert_not_called()
@@ -139,20 +140,20 @@ class TestCoordinatorFcmWatchdog:
     """Test the FCM listener watchdog hook."""
 
     @pytest.mark.asyncio
-    async def test_no_listener_is_noop(self, coordinator):
-        coordinator.notification_listener = None
+    async def test_no_manager_is_noop(self, coordinator):
+        coordinator._notification_manager = None
         await coordinator.ensure_notifications_running()
 
     @pytest.mark.asyncio
-    async def test_delegates_to_listener(self, coordinator):
-        listener = MagicMock()
-        listener.ensure_running = AsyncMock(return_value=True)
-        coordinator.notification_listener = listener
+    async def test_delegates_to_notification_manager(self, coordinator):
+        manager = MagicMock()
+        manager.async_ensure_running = AsyncMock()
+        coordinator._notification_manager = manager
         coordinator._notification_start_time = 12345.0
 
         await coordinator.ensure_notifications_running()
 
-        listener.ensure_running.assert_awaited_once()
+        manager.async_ensure_running.assert_awaited_once()
         assert coordinator._notification_start_time == 12345.0
 
 
@@ -199,23 +200,14 @@ class TestCoordinatorScanInterval:
             call_kwargs = mock_init.call_args
             assert call_kwargs.kwargs["update_interval"].total_seconds() == 600
 
-    def test_default_fcm_storage_suffix_uses_device_id(self, mock_hass, mock_api, pairing):
-        with patch(
-            "homeassistant.helpers.update_coordinator.DataUpdateCoordinator.__init__",
-            return_value=None,
-        ):
-            coordinator = FermaxBlueCoordinator(mock_hass, mock_api, pairing)
-            assert coordinator._fcm_storage_key_suffix == "dev1"
 
-    def test_custom_fcm_storage_suffix_is_kept(self, mock_hass, mock_api, pairing):
-        with patch(
-            "homeassistant.helpers.update_coordinator.DataUpdateCoordinator.__init__",
-            return_value=None,
-        ):
-            coordinator = FermaxBlueCoordinator(
-                mock_hass,
-                mock_api,
-                pairing,
-                fcm_storage_key_suffix="entry123_dev1",
-            )
-            assert coordinator._fcm_storage_key_suffix == "entry123_dev1"
+class TestCoordinatorNotificationRouting:
+    """Test per-pairing notification routing."""
+
+    def test_targets_pairing_by_device_id(self, coordinator):
+        data = {"deviceId": "dev1", "FermaxNotificationType": "Call"}
+        assert coordinator._notification_targets_pairing(data) is True
+
+    def test_ignores_other_pairing_room_id(self, coordinator):
+        data = {"RoomId": "otherdev_1234", "FermaxNotificationType": "Call"}
+        assert coordinator._notification_targets_pairing(data) is False
